@@ -1,14 +1,13 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::num::NonZeroU8;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tinyjson::{InnerAsRef, JsonValue};
-use std::path::{Path, PathBuf};
-use serde::{Serialize, Deserialize};
-use lazy_static::lazy_static;
 
 const NAME: &'static str = env!("CARGO_PKG_NAME");
 
@@ -197,23 +196,24 @@ impl Viewer {
         })
     }
 
-    fn dl(&self, id: &str) {
+    fn dl(&self, id: &str) -> eyre::Result<()> {
         let url = format!("https://www.youtube.com/watch?v={id}");
         let dl_dir = cache().join(id);
 
-        let Ok(output_filename) = Command::new("yt-dlp").args([&url, "--print", "filename"]).output() else {
-            return;
+        let Ok(output_filename) = Command::new("yt-dlp")
+            .args([&url, "--print", "filename"])
+            .output()
+        else {
+            return Ok(());
         };
-        let output_filename = String::from_utf8(output_filename.stdout).unwrap();
-        
+        let output_filename = String::from_utf8(output_filename.stdout)?;
+
         let stdout_path = dl_dir.join("yt-dlp-stdout.log");
         let stderr_path = dl_dir.join("yt-dlp-stderr.log");
         if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
-            let _ = fs::remove_dir_all(&dl_dir);
+            fs::remove_dir_all(&dl_dir)?;
         }
-        if fs::create_dir_all(&dl_dir).is_err() {
-            return;
-        }
+        fs::create_dir_all(&dl_dir)?;
         let stdout = match File::create(&stdout_path) {
             Ok(x) => Stdio::from(x),
             Err(_) => Stdio::null(),
@@ -232,19 +232,18 @@ impl Viewer {
             .arg(url)
             .stdout(stdout)
             .stderr(stderr)
-            .status()
-            .unwrap();
+            .status()?;
 
         // TODO: check error types and report errors well
-        if !status.success() {
+        if !status.success() && !fs::exists(&output_filename).is_ok_and(|x| x) {
             eprintln!(
                 "Error: Failed to download YouTube video with id \"{id}\". Check log files: \"{stdout_path:?}\" and \"{stderr_path:?}\""
-                
             );
         }
 
-        let _ = fs::rename(dl_dir.join(&output_filename), output_filename);
-        let _ = fs::remove_dir_all(dl_dir);
+        fs::rename(dl_dir.join(&output_filename), output_filename)?;
+        fs::remove_dir_all(dl_dir)?;
+        Ok(())
     }
 }
 
@@ -273,7 +272,7 @@ enum Id {
 struct Subscriber {
     // YouTube Channel URLs
     pub list: Arc<Mutex<SubscriberList>>,
-    pub watching: HashMap<String, std::thread::JoinHandle<()>>,
+    pub watching: HashMap<String, std::thread::JoinHandle<eyre::Result<()>>>,
     pub downloaded: HashSet<String>,
 }
 
@@ -284,12 +283,26 @@ struct SubscriberList {
 }
 
 impl Subscriber {
-    fn spawn(mut self) {
+    fn spawn(mut self) -> eyre::Result<()> {
         let mut yt = Viewer::default();
-        yt
-            .live_from_start(true)
+        yt.live_from_start(true)
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
+
+        // Finish unfinished streams that may've ended
+        for entry in fs::read_dir(cache())? {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let id = entry.file_name();
+            let id = id.to_string_lossy().to_string();
+            let t = std::thread::spawn({
+                let id = id.clone();
+                let yt = yt.clone();
+                move || yt.dl(&id)
+            });
+            self.watching.insert(id, t);
+        }
 
         loop {
             let list = self.list.lock().unwrap();
@@ -302,35 +315,42 @@ impl Subscriber {
             }
             for r in remove {
                 println!("Finished downloading {r}!");
-                self.watching
+                if let Err(e) = self
+                    .watching
                     .remove(&r)
                     .unwrap()
                     .join()
-                    .expect("Download thread shouldn't panic");
+                    .expect("Download thread shouldn't panic")
+                {
+                    eprintln!("Download error: {e}");
+                }
                 self.downloaded.insert(r);
             }
 
             for item in list.yt.iter() {
                 if let Some(info) = yt.live_info(item) {
-                    let vid = format!("YouTube video {}", info.id);
-                    if info.is_live && !self.watching.contains_key(&vid) && !self.downloaded.contains(&vid) {
+                    if info.is_live
+                        && !self.watching.contains_key(&info.id)
+                        && !self.downloaded.contains(&info.id)
+                    {
                         println!(
                             "{} is live!\nDownloading \"{}\"",
                             info.uploader, info.title
                         );
                         let t = std::thread::spawn({
+                            let id = info.id.clone();
                             let yt = yt.clone();
-                            move || {
-                                yt.dl(&info.id);
-                            }
+                            move || yt.dl(&id)
                         });
-                        self.watching.insert(vid, t);
+                        self.watching.insert(info.id, t);
                     }
                 }
             }
             std::mem::drop(list);
             std::thread::sleep(Duration::from_secs(60));
         }
+
+        Ok(())
     }
 }
 
@@ -343,8 +363,8 @@ struct Config {
 impl Config {
     fn load(path: &Path) -> eyre::Result<Self> {
         let config = if path.exists() {
-             let toml = fs::read_to_string(path)?;
-             basic_toml::from_str(&toml)?
+            let toml = fs::read_to_string(path)?;
+            basic_toml::from_str(&toml)?
         } else {
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
@@ -362,9 +382,12 @@ impl Config {
 }
 
 fn main() -> eyre::Result<()> {
-    let config_path = dirs::config_dir().expect("config dir").join(NAME).join("config.toml");
+    let config_path = dirs::config_dir()
+        .expect("config dir")
+        .join(NAME)
+        .join("config.toml");
     let config = Config::load(&config_path)?;
-    
+
     // TODO: config reloading
 
     let subscriber = Subscriber::default();
@@ -373,7 +396,7 @@ fn main() -> eyre::Result<()> {
         let mut list = sublist.lock().unwrap();
         *list = SubscriberList { yt: config.yt };
     }
-    subscriber.spawn();
+    subscriber.spawn()?;
     loop {
         std::thread::sleep(Duration::from_secs(1024));
     }
