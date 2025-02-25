@@ -208,6 +208,10 @@ impl Viewer {
         };
         let output_filename = String::from_utf8(output_filename.stdout)?;
 
+        if fs::exists(&output_filename)? {
+            return Ok(());
+        }
+
         let stdout_path = dl_dir.join("yt-dlp-stdout.log");
         let stderr_path = dl_dir.join("yt-dlp-stderr.log");
         if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
