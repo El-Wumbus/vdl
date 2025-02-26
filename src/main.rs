@@ -1,3 +1,4 @@
+use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -8,7 +9,6 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tinyjson::{InnerAsRef, JsonValue};
-use eyre::WrapErr;
 
 const NAME: &'static str = env!("CARGO_PKG_NAME");
 
@@ -197,10 +197,7 @@ impl Viewer {
         })
     }
 
-    fn yt_dl(&self, id: &str) -> eyre::Result<()> {
-        let url = format!("https://www.youtube.com/watch?v={id}");
-        let dl_dir = cache().join(id);
-
+    fn dl(&self, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
         let Ok(output_filename) = Command::new("yt-dlp")
             .args([&url, "--print", "filename"])
             .output()
@@ -208,14 +205,19 @@ impl Viewer {
             return Ok(());
         };
         let output_filename = String::from_utf8(output_filename.stdout)?;
-        let output_filename = output_filename.trim();
-        let tmp_out_path = dl_dir.join(&output_filename);
+        let mut output_filename = PathBuf::from(output_filename.trim());
 
+        if let Some(format) = self.remux_video.as_deref() {
+            output_filename.set_extension(format);
+        }
+
+        let tmp_out_path = dl_dir.join(&output_filename);
         if fs::exists(&output_filename)? {
             return Ok(());
         }
         if tmp_out_path.exists() {
-            fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
+            fs::rename(&tmp_out_path, output_filename)
+                .wrap_err(format!("{tmp_out_path:?}"))?;
             fs::remove_dir_all(dl_dir)?;
             return Ok(());
         }
@@ -235,9 +237,6 @@ impl Viewer {
             Err(_) => Stdio::null(),
         };
 
-        println!(
-            "Downloading {id} from YouTube. See {stdout_path:?} and {stderr_path:?} for logs."
-        );
         let status = Command::new("yt-dlp")
             .current_dir(&dl_dir)
             .args(self.args())
@@ -246,16 +245,16 @@ impl Viewer {
             .stderr(stderr)
             .status()?;
 
-        // TODO: check error types and report errors well
-        if !status.success() && !fs::exists(&output_filename).is_ok_and(|x| x) {
-            eprintln!(
-                "Error: Failed to download YouTube video with id \"{id}\". Check log files: \"{stdout_path:?}\" and \"{stderr_path:?}\""
-            );
-        }
-
-        fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
+        fs::rename(&tmp_out_path, output_filename)
+            .context(format!("{tmp_out_path:?}"))?;
         fs::remove_dir_all(dl_dir)?;
         Ok(())
+    }
+
+    fn yt_dl(&self, id: &str) -> eyre::Result<()> {
+        let url = format!("https://www.youtube.com/watch?v={id}");
+        let dl_dir = cache().join(id);
+        self.dl(&url, dl_dir)
     }
 
     fn twitch_is_live(id: &str) -> bool {
@@ -274,63 +273,7 @@ impl Viewer {
     fn twitch_dl(&self, id: &str) -> eyre::Result<()> {
         let url = format!("https://www.twitch.tv/{id}");
         let dl_dir = cache().join(format!("twitch:{id}"));
-
-        let Ok(output_filename) = Command::new("yt-dlp")
-            .args([&url, "--print", "filename"])
-            .output()
-        else {
-            return Ok(());
-        };
-        let output_filename = String::from_utf8(output_filename.stdout)?;
-        let output_filename = output_filename.trim();
-
-        let tmp_out_path = dl_dir.join(&output_filename);
-        assert!(!output_filename.is_empty());
-        if fs::exists(&output_filename)? {
-            return Ok(());
-        }
-        if tmp_out_path.exists() {
-            fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
-            fs::remove_dir_all(dl_dir)?;
-            return Ok(());
-        }
-
-        let stdout_path = dl_dir.join("yt-dlp-stdout.log");
-        let stderr_path = dl_dir.join("yt-dlp-stderr.log");
-        if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
-            fs::remove_dir_all(&dl_dir)?;
-        }
-        fs::create_dir_all(&dl_dir)?;
-        let stdout = match File::create(&stdout_path) {
-            Ok(x) => Stdio::from(x),
-            Err(_) => Stdio::null(),
-        };
-        let stderr = match File::create(&stderr_path) {
-            Ok(x) => Stdio::from(x),
-            Err(_) => Stdio::null(),
-        };
-
-        println!(
-            "Downloading {id} from Twitch. See {stdout_path:?} and {stderr_path:?} for logs."
-        );
-        let status = Command::new("yt-dlp")
-            .current_dir(&dl_dir)
-            .args(self.args())
-            .arg(url)
-            .stdout(stdout)
-            .stderr(stderr)
-            .status()?;
-
-        // TODO: check error types and report errors well
-        if !status.success() && !fs::exists(&output_filename).is_ok_and(|x| x) {
-            eprintln!(
-                "Error: Failed to download YouTube video with id \"{id}\". Check log files: \"{stdout_path:?}\" and \"{stderr_path:?}\""
-            );
-        }
-
-        fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
-        fs::remove_dir_all(dl_dir)?;
-        Ok(())
+        self.dl(&url, dl_dir)
     }
 }
 
