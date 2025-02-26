@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tinyjson::{InnerAsRef, JsonValue};
+use eyre::WrapErr;
 
 const NAME: &'static str = env!("CARGO_PKG_NAME");
 
@@ -207,8 +208,15 @@ impl Viewer {
             return Ok(());
         };
         let output_filename = String::from_utf8(output_filename.stdout)?;
+        let output_filename = output_filename.trim();
+        let tmp_out_path = dl_dir.join(&output_filename);
 
         if fs::exists(&output_filename)? {
+            return Ok(());
+        }
+        if tmp_out_path.exists() {
+            fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
+            fs::remove_dir_all(dl_dir)?;
             return Ok(());
         }
 
@@ -245,7 +253,7 @@ impl Viewer {
             );
         }
 
-        fs::rename(dl_dir.join(&output_filename), output_filename)?;
+        fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
         fs::remove_dir_all(dl_dir)?;
         Ok(())
     }
@@ -274,8 +282,16 @@ impl Viewer {
             return Ok(());
         };
         let output_filename = String::from_utf8(output_filename.stdout)?;
+        let output_filename = output_filename.trim();
+
+        let tmp_out_path = dl_dir.join(&output_filename);
         assert!(!output_filename.is_empty());
         if fs::exists(&output_filename)? {
+            return Ok(());
+        }
+        if tmp_out_path.exists() {
+            fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
+            fs::remove_dir_all(dl_dir)?;
             return Ok(());
         }
 
@@ -312,7 +328,7 @@ impl Viewer {
             );
         }
 
-        fs::rename(dl_dir.join(&output_filename), output_filename)?;
+        fs::rename(&tmp_out_path, output_filename).context(format!("{tmp_out_path:?}"))?;
         fs::remove_dir_all(dl_dir)?;
         Ok(())
     }
