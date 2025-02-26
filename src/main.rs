@@ -196,7 +196,7 @@ impl Viewer {
         })
     }
 
-    fn dl(&self, id: &str) -> eyre::Result<()> {
+    fn yt_dl(&self, id: &str) -> eyre::Result<()> {
         let url = format!("https://www.youtube.com/watch?v={id}");
         let dl_dir = cache().join(id);
 
@@ -229,6 +229,73 @@ impl Viewer {
 
         println!(
             "Downloading {id} from YouTube. See {stdout_path:?} and {stderr_path:?} for logs."
+        );
+        let status = Command::new("yt-dlp")
+            .current_dir(&dl_dir)
+            .args(self.args())
+            .arg(url)
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()?;
+
+        // TODO: check error types and report errors well
+        if !status.success() && !fs::exists(&output_filename).is_ok_and(|x| x) {
+            eprintln!(
+                "Error: Failed to download YouTube video with id \"{id}\". Check log files: \"{stdout_path:?}\" and \"{stderr_path:?}\""
+            );
+        }
+
+        fs::rename(dl_dir.join(&output_filename), output_filename)?;
+        fs::remove_dir_all(dl_dir)?;
+        Ok(())
+    }
+
+    fn twitch_is_live(id: &str) -> bool {
+        let url = format!("https://www.twitch.tv/{id}");
+        let Ok(output) = Command::new("yt-dlp")
+            .args([&url, "--quiet", "--simulate"])
+            .output()
+        else {
+            return false;
+        };
+
+        String::from_utf8(output.stderr)
+            .is_ok_and(|x| !x.contains("The channel is not currently live"))
+    }
+
+    fn twitch_dl(&self, id: &str) -> eyre::Result<()> {
+        let url = format!("https://www.twitch.tv/{id}");
+        let dl_dir = cache().join(format!("twitch:{id}"));
+
+        let Ok(output_filename) = Command::new("yt-dlp")
+            .args([&url, "--print", "filename"])
+            .output()
+        else {
+            return Ok(());
+        };
+        let output_filename = String::from_utf8(output_filename.stdout)?;
+        assert!(!output_filename.is_empty());
+        if fs::exists(&output_filename)? {
+            return Ok(());
+        }
+
+        let stdout_path = dl_dir.join("yt-dlp-stdout.log");
+        let stderr_path = dl_dir.join("yt-dlp-stderr.log");
+        if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
+            fs::remove_dir_all(&dl_dir)?;
+        }
+        fs::create_dir_all(&dl_dir)?;
+        let stdout = match File::create(&stdout_path) {
+            Ok(x) => Stdio::from(x),
+            Err(_) => Stdio::null(),
+        };
+        let stderr = match File::create(&stderr_path) {
+            Ok(x) => Stdio::from(x),
+            Err(_) => Stdio::null(),
+        };
+
+        println!(
+            "Downloading {id} from Twitch. See {stdout_path:?} and {stderr_path:?} for logs."
         );
         let status = Command::new("yt-dlp")
             .current_dir(&dl_dir)
@@ -284,12 +351,18 @@ struct Subscriber {
 struct SubscriberList {
     // A list of YouTube channel URls
     pub yt: HashSet<String>,
+    // A list of Twitch channel names/IDs
+    pub twitch: HashSet<String>,
 }
 
 impl Subscriber {
     fn spawn(mut self) -> eyre::Result<()> {
         let mut yt = Viewer::default();
         yt.live_from_start(true)
+            .remux_video(Some("mkv"))
+            .cookies_from_browser(Some("firefox"));
+        let mut twitch = Viewer::default();
+        twitch
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
 
@@ -300,12 +373,21 @@ impl Subscriber {
             };
             let id = entry.file_name();
             let id = id.to_string_lossy().to_string();
-            let t = std::thread::spawn({
-                let id = id.clone();
-                let yt = yt.clone();
-                move || yt.dl(&id)
-            });
-            self.watching.insert(id, t);
+            if let Some(id) = id.strip_prefix("twitch:") {
+                let t = std::thread::spawn({
+                    let id = id.to_string();
+                    let twitch = twitch.clone();
+                    move || twitch.twitch_dl(&id)
+                });
+                self.watching.insert(format!("twitch:{id}"), t);
+            } else {
+                let t = std::thread::spawn({
+                    let id = id.to_string();
+                    let yt = yt.clone();
+                    move || yt.yt_dl(&id)
+                });
+                self.watching.insert(id, t);
+            }
         }
 
         loop {
@@ -317,6 +399,7 @@ impl Subscriber {
                     remove.push(id.clone());
                 }
             }
+
             for r in remove {
                 println!("Finished downloading {r}!");
                 if let Err(e) = self
@@ -329,6 +412,22 @@ impl Subscriber {
                     eprintln!("Download error: {e}");
                 }
                 self.downloaded.insert(r);
+            }
+
+            for id in list.twitch.iter() {
+                let tid = format!("twitch:{id}");
+                if Viewer::twitch_is_live(id)
+                    && !self.watching.contains_key(&tid)
+                    && !self.downloaded.contains(&tid)
+                {
+                    println!("Downloading {id}'s  livestream!",);
+                    let t = std::thread::spawn({
+                        let id = id.clone();
+                        let twitch = twitch.clone();
+                        move || twitch.twitch_dl(&id)
+                    });
+                    self.watching.insert(tid, t);
+                }
             }
 
             for item in list.yt.iter() {
@@ -344,7 +443,7 @@ impl Subscriber {
                         let t = std::thread::spawn({
                             let id = info.id.clone();
                             let yt = yt.clone();
-                            move || yt.dl(&id)
+                            move || yt.yt_dl(&id)
                         });
                         self.watching.insert(info.id, t);
                     }
@@ -362,6 +461,7 @@ impl Subscriber {
 struct Config {
     /// YouTube ids
     yt: HashSet<String>,
+    twitch: HashSet<String>,
 }
 
 impl Config {
@@ -398,7 +498,10 @@ fn main() -> eyre::Result<()> {
     let sublist = subscriber.list.clone();
     {
         let mut list = sublist.lock().unwrap();
-        *list = SubscriberList { yt: config.yt };
+        *list = SubscriberList {
+            yt: config.yt,
+            twitch: config.twitch,
+        };
     }
     subscriber.spawn()?;
     loop {
