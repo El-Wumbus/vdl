@@ -1,4 +1,5 @@
-use eyre::WrapErr;
+use eyre::eyre;
+use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -8,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tinyjson::{InnerAsRef, JsonValue};
 
 const NAME: &'static str = env!("CARGO_PKG_NAME");
 
@@ -31,8 +31,8 @@ impl Default for Viewer {
     fn default() -> Self {
         Self {
             live_from_start: false,
-            embed_metadata: true,
-            embed_thumbnail: true,
+            embed_metadata: false,  // true,
+            embed_thumbnail: false, // true,
             no_progress: true,
             concurrent_fragments: None,
             cookies_from_browser: None,
@@ -110,7 +110,7 @@ impl Viewer {
         args
     }
 
-    fn video_info(&self, id: &str) -> Result<VideoInfo, ()> {
+    /*fn video_info(&self, id: &str) -> Result<VideoInfo, ()> {
         let url = format!("https://www.youtube.com/watch?v={id}");
         let output = Command::new("yt-dlp")
             .args(self.args())
@@ -138,63 +138,21 @@ impl Viewer {
             .unwrap()
             .clone();
         Ok(VideoInfo { id, title })
-    }
+    }*/
 
-    fn live_info(&self, id: &str) -> Option<YtLiveInfo> {
+    fn live_info(&self, id: &str) -> eyre::Result<Option<YtLiveInfo>> {
         let url = format!("https://www.youtube.com/{id}/live");
         let output = Command::new("yt-dlp")
             .args(self.args())
             .arg("-J")
             .arg(url)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        if !output.status.success() || stderr.lines().any(|x| x.starts_with("ERROR")) {
-            return None;
+            .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        if stdout.is_empty() {
+            return Ok(None);
         }
-
-        let parsed: JsonValue = stdout.parse().unwrap();
-        let object: &HashMap<_, _> = parsed.get().unwrap();
-
-        let id: String = object
-            .get("id")
-            .and_then(String::json_value_as)
-            .unwrap()
-            .clone();
-        let title = object
-            .get("title")
-            .and_then(String::json_value_as)
-            .unwrap()
-            .clone();
-        let is_live = object
-            .get("is_live")
-            .and_then(bool::json_value_as)
-            .unwrap()
-            .clone();
-        let was_live = object
-            .get("was_live")
-            .and_then(bool::json_value_as)
-            .unwrap()
-            .clone();
-        let webpage_url = object
-            .get("webpage_url")
-            .and_then(String::json_value_as)
-            .unwrap()
-            .clone();
-        let uploader = object
-            .get("uploader")
-            .and_then(String::json_value_as)
-            .unwrap()
-            .clone();
-        Some(YtLiveInfo {
-            id,
-            title,
-            is_live,
-            was_live,
-            webpage_url,
-            uploader,
-        })
+        let info: YtLiveInfo = serde_json::from_str(&stdout)?;
+        Ok(Some(info))
     }
 
     fn dl(&self, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
@@ -216,8 +174,9 @@ impl Viewer {
             return Ok(());
         }
         if tmp_out_path.exists() {
-            fs::rename(&tmp_out_path, output_filename)
-                .wrap_err(format!("{tmp_out_path:?}"))?;
+            fs::rename(&tmp_out_path, &output_filename)
+                .map_err(|e| eyre!("{e}: {tmp_out_path:?}"))?;
+
             fs::remove_dir_all(dl_dir)?;
             return Ok(());
         }
@@ -237,7 +196,7 @@ impl Viewer {
             Err(_) => Stdio::null(),
         };
 
-        let status = Command::new("yt-dlp")
+        let _status = Command::new("yt-dlp")
             .current_dir(&dl_dir)
             .args(self.args())
             .arg(url)
@@ -245,8 +204,8 @@ impl Viewer {
             .stderr(stderr)
             .status()?;
 
-        fs::rename(&tmp_out_path, output_filename)
-            .context(format!("{tmp_out_path:?}"))?;
+        fs::rename(&tmp_out_path, &output_filename)
+            .map_err(|e| eyre!("{e}: {tmp_out_path:?}"))?;
         fs::remove_dir_all(dl_dir)?;
         Ok(())
     }
@@ -283,7 +242,7 @@ struct VideoInfo {
     title: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct YtLiveInfo {
     id: String,
     title: String,
@@ -291,19 +250,6 @@ struct YtLiveInfo {
     was_live: bool,
     webpage_url: String,
     uploader: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Id {
-    Yt(String),
-}
-
-#[derive(Debug, Default)]
-struct Subscriber {
-    // YouTube Channel URLs
-    pub list: Arc<Mutex<SubscriberList>>,
-    pub watching: HashMap<String, std::thread::JoinHandle<eyre::Result<()>>>,
-    pub downloaded: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -314,8 +260,26 @@ struct SubscriberList {
     pub twitch: HashSet<String>,
 }
 
+// TODO:
+#[derive(Debug, Clone, PartialEq)]
+enum Id {
+    Yt(String),
+    Twitch(String),
+}
+
+#[derive(Debug, Default)]
+struct Subscriber {
+    // YouTube Channel URLs
+    pub list: Arc<Mutex<SubscriberList>>,
+
+    pub watching: HashMap<String, std::thread::JoinHandle<eyre::Result<()>>>,
+    pub downloaded: HashSet<String>,
+    multi_progress: MultiProgress,
+    progress_bars: HashMap<String, ProgressBar>,
+}
+
 impl Subscriber {
-    fn spawn(mut self) -> eyre::Result<()> {
+    pub fn spawn(mut self) -> eyre::Result<()> {
         let mut yt = Viewer::default();
         yt.live_from_start(true)
             .remux_video(Some("mkv"))
@@ -325,27 +289,38 @@ impl Subscriber {
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
 
+        let cache_dir = cache();
+        if !cache_dir.exists() {
+            fs::create_dir_all(&cache_dir)?;
+        }
         // Finish unfinished streams that may've ended
-        for entry in fs::read_dir(cache())? {
+        for entry in fs::read_dir(&cache_dir)? {
             let Ok(entry) = entry else {
                 continue;
             };
             let id = entry.file_name();
             let id = id.to_string_lossy().to_string();
             if let Some(id) = id.strip_prefix("twitch:") {
+                let tid = format!("twitch:{id}");
                 let t = std::thread::spawn({
                     let id = id.to_string();
                     let twitch = twitch.clone();
                     move || twitch.twitch_dl(&id)
                 });
-                self.watching.insert(format!("twitch:{id}"), t);
+                self.watching.insert(tid.clone(), t);
+                let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                pb.set_message(format!("{id}'s Twitch stream"));
+                self.progress_bars.insert(tid, pb);
             } else {
                 let t = std::thread::spawn({
                     let id = id.to_string();
                     let yt = yt.clone();
                     move || yt.yt_dl(&id)
                 });
-                self.watching.insert(id, t);
+                self.watching.insert(id.clone(), t);
+                let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                pb.set_message(format!("Resuming YouTube download: {id:?}"));
+                self.progress_bars.insert(id, pb);
             }
         }
 
@@ -360,7 +335,7 @@ impl Subscriber {
             }
 
             for r in remove {
-                println!("Finished downloading {r}!");
+                let pb = self.progress_bars.remove(&r).unwrap();
                 if let Err(e) = self
                     .watching
                     .remove(&r)
@@ -368,8 +343,11 @@ impl Subscriber {
                     .join()
                     .expect("Download thread shouldn't panic")
                 {
-                    eprintln!("Download error: {e}");
+                    pb.finish_with_message(format!("Download error: {e}"));
+                } else {
+                    pb.finish_with_message("Downloaded!");
                 }
+
                 self.downloaded.insert(r);
             }
 
@@ -385,34 +363,38 @@ impl Subscriber {
                         let twitch = twitch.clone();
                         move || twitch.twitch_dl(&id)
                     });
-                    self.watching.insert(tid, t);
+                    self.watching.insert(tid.clone(), t);
+                    let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                    pb.set_message(format!("{id}'s Twitch stream"));
+                    self.progress_bars.insert(tid, pb);
                 }
             }
 
             for item in list.yt.iter() {
-                if let Some(info) = yt.live_info(item) {
+                if let Ok(Some(info)) = yt.live_info(item) {
                     if info.is_live
                         && !self.watching.contains_key(&info.id)
                         && !self.downloaded.contains(&info.id)
                     {
-                        println!(
-                            "{} is live!\nDownloading \"{}\"",
-                            info.uploader, info.title
-                        );
                         let t = std::thread::spawn({
                             let id = info.id.clone();
                             let yt = yt.clone();
                             move || yt.yt_dl(&id)
                         });
-                        self.watching.insert(info.id, t);
+                        self.watching.insert(info.id.clone(), t);
+                        let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                        pb.set_message(format!("{:?} by {}", info.title, info.uploader));
+                        self.progress_bars.insert(info.id, pb);
                     }
                 }
             }
             std::mem::drop(list);
-            std::thread::sleep(Duration::from_secs(60));
-        }
 
-        Ok(())
+            for _ in 0..(30 * 1000 / 100) {
+                std::thread::sleep(Duration::from_millis(100));
+                self.progress_bars.values().for_each(|pb| pb.inc(1));
+            }
+        }
     }
 }
 
