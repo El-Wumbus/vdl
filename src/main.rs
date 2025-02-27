@@ -1,5 +1,5 @@
 use eyre::eyre;
-use indicatif::{MultiProgress, ProgressBar};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -31,8 +31,8 @@ impl Default for Viewer {
     fn default() -> Self {
         Self {
             live_from_start: false,
-            embed_metadata: false,  // true,
-            embed_thumbnail: false, // true,
+            embed_metadata: true,
+            embed_thumbnail: true,
             no_progress: true,
             concurrent_fragments: None,
             cookies_from_browser: None,
@@ -148,6 +148,7 @@ impl Viewer {
             .arg(url)
             .output()?;
         let stdout = String::from_utf8(output.stdout)?;
+        let stdout = stdout.trim();
         if stdout.is_empty() {
             return Ok(None);
         }
@@ -156,15 +157,18 @@ impl Viewer {
     }
 
     fn dl(&self, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
-        let Ok(output_filename) = Command::new("yt-dlp")
-            .args([&url, "--print", "filename"])
+        let Ok(output) = Command::new("yt-dlp")
+            .args([&url, "--print", "_filename"])
             .output()
         else {
             return Ok(());
         };
-        let output_filename = String::from_utf8(output_filename.stdout)?;
-        let mut output_filename = PathBuf::from(output_filename.trim());
-
+        let stdout = String::from_utf8(output.stdout)?;
+        let stdout = stdout.trim();
+        if stdout.is_empty() {
+            return Err(eyre!("Filename is empty!"));
+        }
+        let mut output_filename = PathBuf::from(stdout);
         if let Some(format) = self.remux_video.as_deref() {
             output_filename.set_extension(format);
         }
@@ -199,7 +203,7 @@ impl Viewer {
         let _status = Command::new("yt-dlp")
             .current_dir(&dl_dir)
             .args(self.args())
-            .arg(url)
+            .args([&url, "--output", tmp_out_path.to_str().unwrap()])
             .stdout(stdout)
             .stderr(stderr)
             .status()?;
@@ -280,10 +284,22 @@ struct Subscriber {
 
 impl Subscriber {
     pub fn spawn(mut self) -> eyre::Result<()> {
+        fn pbar() -> ProgressBar {
+            let pb = ProgressBar::new_spinner().with_elapsed(Duration::ZERO);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} {msg} [{elapsed_precise}]",
+                )
+                .unwrap(),
+            );
+            pb
+        }
+
         let mut yt = Viewer::default();
         yt.live_from_start(true)
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
+
         let mut twitch = Viewer::default();
         twitch
             .remux_video(Some("mkv"))
@@ -308,7 +324,7 @@ impl Subscriber {
                     move || twitch.twitch_dl(&id)
                 });
                 self.watching.insert(tid.clone(), t);
-                let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                let pb = self.multi_progress.add(pbar());
                 pb.set_message(format!("{id}'s Twitch stream"));
                 self.progress_bars.insert(tid, pb);
             } else {
@@ -318,7 +334,7 @@ impl Subscriber {
                     move || yt.yt_dl(&id)
                 });
                 self.watching.insert(id.clone(), t);
-                let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                let pb = self.multi_progress.add(pbar());
                 pb.set_message(format!("Resuming YouTube download: {id:?}"));
                 self.progress_bars.insert(id, pb);
             }
@@ -364,7 +380,7 @@ impl Subscriber {
                         move || twitch.twitch_dl(&id)
                     });
                     self.watching.insert(tid.clone(), t);
-                    let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                    let pb = self.multi_progress.add(pbar());
                     pb.set_message(format!("{id}'s Twitch stream"));
                     self.progress_bars.insert(tid, pb);
                 }
@@ -382,7 +398,7 @@ impl Subscriber {
                             move || yt.yt_dl(&id)
                         });
                         self.watching.insert(info.id.clone(), t);
-                        let pb = self.multi_progress.add(ProgressBar::new_spinner());
+                        let pb = self.multi_progress.add(pbar());
                         pb.set_message(format!("{:?} by {}", info.title, info.uploader));
                         self.progress_bars.insert(info.id, pb);
                     }
@@ -392,7 +408,7 @@ impl Subscriber {
 
             for _ in 0..(30 * 1000 / 100) {
                 std::thread::sleep(Duration::from_millis(100));
-                self.progress_bars.values().for_each(|pb| pb.inc(1));
+                self.progress_bars.values().for_each(|pb| pb.tick());
             }
         }
     }
@@ -400,8 +416,11 @@ impl Subscriber {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Config {
+    dir: Option<PathBuf>,
     /// YouTube ids
+    #[serde(default)]
     yt: HashSet<String>,
+    #[serde(default)]
     twitch: HashSet<String>,
 }
 
@@ -434,6 +453,9 @@ fn main() -> eyre::Result<()> {
     let config = Config::load(&config_path)?;
 
     // TODO: config reloading
+    if let Some(dir) = config.dir.as_deref() {
+        std::env::set_current_dir(dir).map_err(|e| eyre!("{dir:?}: {e}"))?;
+    }
 
     let subscriber = Subscriber::default();
     let sublist = subscriber.list.clone();
