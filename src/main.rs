@@ -1,13 +1,18 @@
 use eyre::eyre;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use signal_hook::consts::SIGHUP;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use clap::Parser;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 const NAME: &'static str = env!("CARGO_PKG_NAME");
@@ -157,6 +162,7 @@ impl Viewer {
     }
 
     fn dl(&self, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
+        let current_dir = std::env::current_dir()?;
         let Ok(output) = Command::new("yt-dlp")
             .args([&url, "--print", "_filename"])
             .output()
@@ -172,14 +178,15 @@ impl Viewer {
         if let Some(format) = self.remux_video.as_deref() {
             output_filename.set_extension(format);
         }
-
+        let final_out = current_dir.join(&output_filename);
         let tmp_out_path = dl_dir.join(&output_filename);
-        if fs::exists(&output_filename)? {
+
+        if fs::exists(&final_out)? {
             return Ok(());
         }
         if tmp_out_path.exists() {
-            fs::rename(&tmp_out_path, &output_filename)
-                .map_err(|e| eyre!("{e}: {tmp_out_path:?}"))?;
+            fs::rename(&tmp_out_path, &final_out)
+                .map_err(|e| eyre!("{e}: {tmp_out_path:?} -> {final_out:?}"))?;
 
             fs::remove_dir_all(dl_dir)?;
             return Ok(());
@@ -203,13 +210,15 @@ impl Viewer {
         let _status = Command::new("yt-dlp")
             .current_dir(&dl_dir)
             .args(self.args())
+            // yt-dlp often doesn't write to what it says it will, so that's why I must
+            // remind it to.
             .args([&url, "--output", tmp_out_path.to_str().unwrap()])
             .stdout(stdout)
             .stderr(stderr)
             .status()?;
 
-        fs::rename(&tmp_out_path, &output_filename)
-            .map_err(|e| eyre!("{e}: {tmp_out_path:?}"))?;
+        fs::rename(&tmp_out_path, &final_out)
+            .map_err(|e| eyre!("{e}: {tmp_out_path:?} -> {final_out:?}"))?;
         fs::remove_dir_all(dl_dir)?;
         Ok(())
     }
@@ -283,7 +292,7 @@ struct Subscriber {
 }
 
 impl Subscriber {
-    pub fn spawn(mut self) -> eyre::Result<()> {
+    pub fn spawn(mut self, silent: bool) -> eyre::Result<()> {
         fn pbar() -> ProgressBar {
             let pb = ProgressBar::new_spinner().with_elapsed(Duration::ZERO);
             pb.set_style(
@@ -324,9 +333,11 @@ impl Subscriber {
                     move || twitch.twitch_dl(&id)
                 });
                 self.watching.insert(tid.clone(), t);
-                let pb = self.multi_progress.add(pbar());
-                pb.set_message(format!("{id}'s Twitch stream"));
-                self.progress_bars.insert(tid, pb);
+                if !silent {
+                    let pb = self.multi_progress.add(pbar());
+                    pb.set_message(format!("{id}'s Twitch stream"));
+                    self.progress_bars.insert(tid, pb);
+                }
             } else {
                 let t = std::thread::spawn({
                     let id = id.to_string();
@@ -334,9 +345,11 @@ impl Subscriber {
                     move || yt.yt_dl(&id)
                 });
                 self.watching.insert(id.clone(), t);
-                let pb = self.multi_progress.add(pbar());
-                pb.set_message(format!("Resuming YouTube download: {id:?}"));
-                self.progress_bars.insert(id, pb);
+                if !silent {
+                    let pb = self.multi_progress.add(pbar());
+                    pb.set_message(format!("Resuming YouTube download: {id:?}"));
+                    self.progress_bars.insert(id, pb);
+                }
             }
         }
 
@@ -380,9 +393,11 @@ impl Subscriber {
                         move || twitch.twitch_dl(&id)
                     });
                     self.watching.insert(tid.clone(), t);
-                    let pb = self.multi_progress.add(pbar());
-                    pb.set_message(format!("{id}'s Twitch stream"));
-                    self.progress_bars.insert(tid, pb);
+                    if !silent {
+                        let pb = self.multi_progress.add(pbar());
+                        pb.set_message(format!("{id}'s Twitch stream"));
+                        self.progress_bars.insert(tid, pb);
+                    }
                 }
             }
 
@@ -398,9 +413,11 @@ impl Subscriber {
                             move || yt.yt_dl(&id)
                         });
                         self.watching.insert(info.id.clone(), t);
-                        let pb = self.multi_progress.add(pbar());
-                        pb.set_message(format!("{:?} by {}", info.title, info.uploader));
-                        self.progress_bars.insert(info.id, pb);
+                        if !silent {
+                            let pb = self.multi_progress.add(pbar());
+                            pb.set_message(format!("{:?} by {}", info.title, info.uploader));
+                            self.progress_bars.insert(info.id, pb);
+                        }
                     }
                 }
             }
@@ -445,14 +462,24 @@ impl Config {
     }
 }
 
+#[derive(Debug, clap::Parser)]
+#[command(version, about)]
+struct Args {
+    #[arg(short, long)]
+    silent: bool
+}
+
 fn main() -> eyre::Result<()> {
+    let exit = Arc::new(AtomicBool::new(false));
+    let reload_config = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGHUP, reload_config.clone()).unwrap();
+
+    let args = Args::parse();
     let config_path = dirs::config_dir()
         .expect("config dir")
         .join(NAME)
         .join("config.toml");
-    let config = Config::load(&config_path)?;
-
-    // TODO: config reloading
+    let mut config = Config::load(&config_path)?;
     if let Some(dir) = config.dir.as_deref() {
         std::env::set_current_dir(dir).map_err(|e| eyre!("{dir:?}: {e}"))?;
     }
@@ -466,8 +493,39 @@ fn main() -> eyre::Result<()> {
             twitch: config.twitch,
         };
     }
-    subscriber.spawn()?;
+    
+    let subscriber = std::thread::spawn( move || subscriber.spawn(args.silent));
+    
     loop {
-        std::thread::sleep(Duration::from_secs(1024));
+        if subscriber.is_finished() {
+            eprintln!("Subscriber exited!");
+            subscriber.join().unwrap()?;
+            std::process::exit(1);
+        }
+        if reload_config.swap(false, Ordering::Relaxed) {
+            eprintln!("Reloading config..");
+            match Config::load(&config_path) {
+                Ok(c) => {
+                    eprintln!("Reloaded config!");
+                    let old_dir = config.dir;
+                    config = c;
+                    let mut list = sublist.lock().unwrap();
+                    *list = SubscriberList {
+                        yt: config.yt,
+                        twitch: config.twitch,
+                    };
+                    if config.dir.is_some() && config.dir != old_dir {
+                        let dir = config.dir.as_deref().unwrap();
+                        std::env::set_current_dir(dir)
+                            .map_err(|e| eyre!("{dir:?}: {e}"))?;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to reload state (retaining previous state): {e}")
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
