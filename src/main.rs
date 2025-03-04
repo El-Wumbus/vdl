@@ -1,48 +1,44 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use eyre::eyre;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use signal_hook::consts::SIGHUP;
+use signal_hook::consts::{SIGHUP, SIGTERM};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::num::NonZeroU8;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const NAME: &'static str = env!("CARGO_PKG_NAME");
 
-fn cache() -> PathBuf {
-    dirs::cache_dir().expect("cache dir").join("vdl")
-}
-
 #[derive(Clone, Debug)]
 struct Viewer {
-    live_from_start: bool,
-    embed_metadata: bool,
-    embed_thumbnail: bool,
-    no_progress: bool,
+    live_from_start:      bool,
+    embed_metadata:       bool,
+    embed_thumbnail:      bool,
+    no_progress:          bool,
     concurrent_fragments: Option<NonZeroU8>,
-    playlist_items: Option<u64>,
-    remux_video: Option<String>,
+    playlist_items:       Option<u64>,
+    remux_video:          Option<String>,
     cookies_from_browser: Option<String>,
 }
 impl Default for Viewer {
     fn default() -> Self {
         Self {
-            live_from_start: false,
-            embed_metadata: true,
-            embed_thumbnail: true,
-            no_progress: true,
+            live_from_start:      false,
+            embed_metadata:       true,
+            embed_thumbnail:      true,
+            no_progress:          true,
             concurrent_fragments: None,
             cookies_from_browser: None,
-            remux_video: None,
-            playlist_items: None,
+            remux_video:          None,
+            playlist_items:       None,
         }
     }
 }
@@ -199,9 +195,8 @@ impl Viewer {
         Ok(())
     }
 
-    fn yt_dl(&self, id: &str) -> eyre::Result<()> {
+    fn yt_dl(&self, id: &str, dl_dir: PathBuf) -> eyre::Result<()> {
         let url = format!("https://www.youtube.com/watch?v={id}");
-        let dl_dir = cache().join(id);
         self.dl(&url, dl_dir)
     }
 
@@ -218,32 +213,20 @@ impl Viewer {
             .is_ok_and(|x| !x.contains("The channel is not currently live"))
     }
 
-    fn twitch_dl(&self, id: &str) -> eyre::Result<()> {
+    fn twitch_dl(&self, id: &str, dl_dir: PathBuf) -> eyre::Result<()> {
         let url = format!("https://www.twitch.tv/{id}");
-        let dl_dir = cache().join(format!("twitch:{id}"));
         self.dl(&url, dl_dir)
     }
 }
 
-#[derive(Debug, Clone)]
-struct VideoInfo {
-    id: String,
-    title: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct YtLiveInfo {
-    id: String,
-    title: String,
-    is_live: bool,
-    was_live: bool,
+    id:          String,
+    title:       String,
+    is_live:     bool,
+    was_live:    bool,
     webpage_url: String,
-    uploader: String,
-}
-
-#[derive(Debug, Default)]
-struct SubscriberList {
-    pub ids: HashSet<Id>,
+    uploader:    String,
 }
 
 // TODO:
@@ -253,18 +236,11 @@ enum Id {
     Yt { yt_id: String },
     Twitch { twitch_id: String },
 }
-
 impl Id {
-    fn inner(self) -> String {
+    fn as_str(&self) -> &str {
         match self {
             Id::Yt { yt_id } => yt_id,
             Id::Twitch { twitch_id } => twitch_id,
-        }
-    }
-    fn as_str(&self) -> &str {
-        match self {
-            Id::Yt { yt_id } => yt_id.as_str(),
-            Id::Twitch { twitch_id } => twitch_id.as_str(),
         }
     }
 }
@@ -296,18 +272,24 @@ impl std::str::FromStr for Id {
 }
 
 #[derive(Debug, Default)]
+struct InnerSub {
+    pub ids:        HashSet<Id>,
+    pub watching:   HashMap<Id, std::thread::JoinHandle<eyre::Result<()>>>,
+    pub downloaded: HashSet<Id>,
+}
+
+#[derive(Debug, Default)]
 struct Subscriber {
     // YouTube Channel URLs
-    pub list: Arc<Mutex<SubscriberList>>,
+    pub inner: Arc<Mutex<InnerSub>>,
 
-    pub watching: HashMap<Id, std::thread::JoinHandle<eyre::Result<()>>>,
-    pub downloaded: HashSet<Id>,
-    progress_bars: HashMap<Id, ProgressBar>,
+    progress_bars:  HashMap<Id, ProgressBar>,
     multi_progress: MultiProgress,
 }
 
 impl Subscriber {
     pub fn spawn(mut self, silent: bool) -> eyre::Result<()> {
+        let cache_dir = cache();
         fn pbar() -> ProgressBar {
             let pb = ProgressBar::new_spinner().with_elapsed(Duration::ZERO);
             pb.set_style(
@@ -329,11 +311,11 @@ impl Subscriber {
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
 
-        let cache_dir = cache();
         if !cache_dir.exists() {
             fs::create_dir_all(&cache_dir)?;
         }
 
+        let mut inner = self.inner.lock().unwrap();
         // Handle unfinished downloads
         for entry in fs::read_dir(&cache_dir)? {
             let Ok(entry) = entry else {
@@ -343,16 +325,17 @@ impl Subscriber {
             let id = id.to_string_lossy().to_string();
 
             let Ok(id) = id.parse::<Id>() else { continue };
+            let dl_dir = cache_dir.join(id.to_string());
             let t = match id.clone() {
                 Id::Twitch { twitch_id } => {
                     let t = std::thread::spawn({
                         let twitch = twitch.clone();
                         let twitch_id = twitch_id.clone();
-                        move || twitch.twitch_dl(&twitch_id)
+                        move || twitch.twitch_dl(&twitch_id, dl_dir)
                     });
-                    let pb = pbar();
-                    pb.set_message(format!("{twitch_id}'s Twitch stream"));
                     if !silent {
+                        let pb = pbar();
+                        pb.set_message(format!("{twitch_id}'s Twitch stream"));
                         let pb = self.multi_progress.add(pb);
                         self.progress_bars.insert(id.clone(), pb);
                     }
@@ -362,49 +345,55 @@ impl Subscriber {
                     let t = std::thread::spawn({
                         let yt_id = yt_id.clone();
                         let yt = yt.clone();
-                        move || yt.yt_dl(&yt_id)
+                        move || yt.yt_dl(&yt_id, dl_dir)
                     });
-                    let pb = pbar();
-                    pb.set_message(format!("Resuming YouTube video: {yt_id}"));
                     if !silent {
+                        let pb = pbar();
+                        pb.set_message(format!("Resuming YouTube video: {yt_id}"));
                         let pb = self.multi_progress.add(pb);
                         self.progress_bars.insert(id.clone(), pb);
                     }
                     t
                 }
             };
-            self.watching.insert(id.clone(), t);
+            inner.watching.insert(id.clone(), t);
         }
+        std::mem::drop(inner);
 
         loop {
-            let list = self.list.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
 
             let mut remove = vec![];
-            for (id, task) in self.watching.iter() {
+            for (id, task) in inner.watching.iter() {
                 if task.is_finished() {
                     remove.push(id.clone());
                 }
             }
 
             for r in remove {
-                let pb = self.progress_bars.remove(&r).unwrap();
-                if let Err(e) = self
+                let message = if let Err(e) = inner
                     .watching
                     .remove(&r)
                     .unwrap()
                     .join()
                     .expect("Download thread shouldn't panic")
                 {
-                    pb.finish_with_message(format!("{}: Download error: {e}", pb.message()));
+                    format!("Download error: {e}",)
                 } else {
-                    pb.finish_with_message("Downloaded!");
+                    "Downloaded!".to_string()
+                };
+
+                if !silent {
+                    let pb = self.progress_bars.remove(&r).unwrap();
+                    pb.finish_with_message(message);
                 }
 
-                self.downloaded.insert(r);
+                inner.downloaded.insert(r);
             }
 
-            for id in list.ids.iter() {
-                match id {
+            for id in inner.ids.clone() {
+                let dl_dir = cache_dir.join(id.to_string());
+                match &id {
                     Id::Yt { yt_id } => {
                         let Ok(Some(info)) = yt.live_info(&yt_id) else {
                             continue;
@@ -413,15 +402,15 @@ impl Subscriber {
                             yt_id: info.id.clone(),
                         };
                         if info.is_live
-                            && !self.watching.contains_key(&video_id)
-                            && !self.downloaded.contains(&video_id)
+                            && !inner.watching.contains_key(&video_id)
+                            && !inner.downloaded.contains(&video_id)
                         {
                             let thread = std::thread::spawn({
                                 let id = info.id.clone();
                                 let yt = yt.clone();
-                                move || yt.yt_dl(&id)
+                                move || yt.yt_dl(&id, dl_dir)
                             });
-                            self.watching.insert(video_id.clone(), thread);
+                            inner.watching.insert(video_id.clone(), thread);
                             if !silent {
                                 let pb = self.multi_progress.add(pbar());
                                 pb.set_message(format!(
@@ -434,15 +423,15 @@ impl Subscriber {
                     }
                     Id::Twitch { twitch_id }
                         if Viewer::twitch_is_live(&twitch_id)
-                            && !self.watching.contains_key(&id)
-                            && !self.downloaded.contains(&id) =>
+                            && !inner.watching.contains_key(&id)
+                            && !inner.downloaded.contains(&id) =>
                     {
                         let thread = std::thread::spawn({
                             let twitch_id = twitch_id.clone();
                             let twitch = twitch.clone();
-                            move || twitch.twitch_dl(&twitch_id)
+                            move || twitch.twitch_dl(&twitch_id, dl_dir)
                         });
-                        self.watching.insert(id.clone(), thread);
+                        inner.watching.insert(id.clone(), thread);
                         if !silent {
                             let pb = self.multi_progress.add(pbar());
                             pb.set_message(format!("{id}'s Twitch stream"));
@@ -452,9 +441,9 @@ impl Subscriber {
                     _ => {}
                 }
             }
-            std::mem::drop(list);
+            std::mem::drop(inner);
 
-            for _ in 0..(30 * 1000 / 100) {
+            for _ in 0..(45 * 1000 / 100) {
                 std::thread::sleep(Duration::from_millis(100));
                 self.progress_bars.values().for_each(|pb| pb.tick());
             }
@@ -483,6 +472,7 @@ impl Config {
             let config = Config::default();
             let toml = basic_toml::to_string(&config)?;
             let mut f = File::create(path)?;
+
             f.write_all(toml.as_bytes())?;
             config
         };
@@ -490,18 +480,166 @@ impl Config {
     }
 }
 
-#[derive(Debug, clap::Parser)]
+#[derive(Debug, Deserialize, Serialize)]
+enum IpcRequest {
+    GetWatching,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum IpcResponse {
+    Watching(Vec<Id>),
+    Error(String),
+}
+
+struct Ipc {
+    inner_sub: Arc<Mutex<InnerSub>>,
+    listener:  UnixListener,
+}
+
+impl Ipc {
+    fn new(inner_sub: Arc<Mutex<InnerSub>>) -> eyre::Result<Self> {
+        let state_dir = dirs::state_dir().expect("User state dir").join(NAME);
+        let socket = state_dir.join("ipc.sock");
+
+        if !state_dir.exists() {
+            fs::create_dir_all(&state_dir)?;
+        }
+        if socket.exists() {
+            fs::remove_file(&socket).map_err(|e| {
+                eyre!("Failed to remove old socket, maybe a server is running?\n{e}")
+            })?;
+        }
+        Ok(Self {
+            inner_sub,
+            listener: UnixListener::bind(&socket)?,
+        })
+    }
+
+    fn spawn(self) -> eyre::Result<()> {
+        let mut message_body = Vec::new();
+        loop {
+            let (mut stream, _sock_addr) = self.listener.accept()?;
+
+            message_body.clear();
+            stream.read_to_end(&mut message_body)?;
+
+            let response = match serde_json::de::from_slice(&message_body) {
+                Ok(request) => self.handle_request(request),
+                Err(e) => IpcResponse::Error(format!(
+                    "Error: failed to parse JSON request: {e}"
+                )),
+            };
+            let response_json = match serde_json::ser::to_vec(&response) {
+                Ok(x) => x,
+                Err(e) => serde_json::ser::to_vec(&IpcResponse::Error(format!(
+                    "Error: failed to serialize response: {e}"
+                )))
+                .unwrap(),
+            };
+            stream.write_all(&response_json)?;
+        }
+    }
+
+    fn handle_request(&self, req: IpcRequest) -> IpcResponse {
+        match req {
+            IpcRequest::GetWatching => {
+                let inner = self.inner_sub.lock().unwrap();
+                let watching = inner.watching.keys().cloned().collect::<Vec<_>>();
+                IpcResponse::Watching(watching)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
 #[command(version, about)]
-struct Args {
-    #[arg(short, long)]
-    silent: bool,
+enum Args {
+    Watch {
+        #[arg(short, long)]
+        silent: bool,
+    },
+
+    Ipc {
+        #[command(subcommand)]
+        subcommand: IpcCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IpcCommand {
+    GetWatching,
 }
 
 fn main() -> eyre::Result<()> {
-    let reload_config = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGHUP, reload_config.clone()).unwrap();
+    let command = Args::parse();
+    match command {
+        Args::Watch { silent } => serve(silent),
+        Args::Ipc { subcommand } => ipc(subcommand),
+    }
+}
 
-    let args = Args::parse();
+fn ipc(command: IpcCommand) -> eyre::Result<()> {
+    let state_dir = dirs::state_dir().expect("User state dir").join(NAME);
+    let socket = state_dir.join("ipc.sock");
+    let mut stream = UnixStream::connect(&socket).map_err(|e| {
+        eyre!(
+            "Couldn't connect to socket {socket:?} (ensure an instance is running): {e}"
+        )
+    })?;
+
+    let request = match command {
+        IpcCommand::GetWatching => IpcRequest::GetWatching,
+    };
+    let request_json = serde_json::ser::to_vec(&request)?;
+    stream.write(&request_json)?;
+    stream.shutdown(Shutdown::Write)?;
+
+    let mut response_json = Vec::new();
+    stream.read_to_end(&mut response_json)?;
+
+    let response: IpcResponse = serde_json::de::from_slice(&response_json)?;
+    match response {
+        IpcResponse::Watching(watching) => {
+            let twitch = watching
+                .iter()
+                .filter(|x| matches!(x, Id::Twitch { .. }))
+                .map(Id::as_str);
+            let yt = watching
+                .iter()
+                .filter(|x| matches!(x, Id::Yt { .. }))
+                .map(Id::as_str);
+
+            // TODO: Tabular display
+            println!("Watching {} streams", watching.len());
+            if !watching.is_empty() {
+                for (i, id) in twitch.enumerate() {
+                    if i == 0 {
+                        println!("Twitch");
+                    }
+                    println!(":: {id}");
+                }
+                for (i, id) in yt.enumerate() {
+                    if i == 0 {
+                        println!("YouTube");
+                    }
+                    println!(":: {id}");
+                }
+            }
+        }
+        IpcResponse::Error(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn serve(silent: bool) -> eyre::Result<()> {
+    let reload_config = Arc::new(AtomicBool::new(false));
+    let exit = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGHUP, reload_config.clone()).unwrap();
+    signal_hook::flag::register(SIGTERM, exit.clone()).unwrap();
+
     let config_path = dirs::config_dir()
         .expect("config dir")
         .join(NAME)
@@ -512,18 +650,26 @@ fn main() -> eyre::Result<()> {
     }
 
     let subscriber = Subscriber::default();
-    let sublist = subscriber.list.clone();
+    let inner = subscriber.inner.clone();
     {
-        let mut list = sublist.lock().unwrap();
-        *list = SubscriberList { ids: config.ids };
+        let mut inner = inner.lock().unwrap();
+        inner.ids = config.ids;
     }
+    let ipc = Ipc::new(inner.clone())?;
+    std::thread::spawn(move || ipc.spawn());
 
-    let subscriber = std::thread::spawn(move || subscriber.spawn(args.silent));
+    let subscriber = std::thread::spawn(move || subscriber.spawn(silent));
 
     loop {
         if subscriber.is_finished() {
             eprintln!("Subscriber exited!");
             subscriber.join().unwrap()?;
+            std::process::exit(1);
+        }
+        if exit.swap(false, Ordering::Relaxed) {
+            let state_dir = dirs::state_dir().expect("User state dir").join(NAME);
+            let socket = state_dir.join("ipc.sock");
+            let _ = fs::remove_file(socket);
             std::process::exit(1);
         }
         if reload_config.swap(false, Ordering::Relaxed) {
@@ -533,8 +679,8 @@ fn main() -> eyre::Result<()> {
                     eprintln!("Reloaded config!");
                     let old_dir = config.dir;
                     config = c;
-                    let mut list = sublist.lock().unwrap();
-                    *list = SubscriberList { ids: config.ids };
+                    let mut inner = inner.lock().unwrap();
+                    inner.ids = config.ids;
                     if config.dir.is_some() && config.dir != old_dir {
                         let dir = config.dir.as_deref().unwrap();
                         std::env::set_current_dir(dir)
@@ -549,4 +695,8 @@ fn main() -> eyre::Result<()> {
 
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+fn cache() -> PathBuf {
+    dirs::cache_dir().expect("cache dir").join("vdl")
 }

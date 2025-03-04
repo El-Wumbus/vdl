@@ -3,7 +3,11 @@ name = "vdl"
 version = "0.1.0"
 edition = "2024"
 
+[profile.dev]
+opt-level = 1
+
 [profile.release]
+opt-level = 3 
 lto = "fat"
 strip = true
 
