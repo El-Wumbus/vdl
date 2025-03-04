@@ -11,14 +11,14 @@ cargo install --git 'https://github.com/El-Wumbus/vdl'
 ## Configuration
 
 Before `vdl` can be used, it must be configured.  
-The configuration file is located at `XDG_CONFIG_HOME/vdl/config.toml` or
+The configuration file is located at `$XDG_CONFIG_HOME/vdl/config.toml` or
 `~/.config/vdl/config.toml` and looks like the following:
 
 ```toml
 dir = "/home/user/Video" # default: ~/Videos 
 [[ids]]
 yt_id = "@PiscosHour"
-[[twitch]]
+[[ids]]
 twitch_id = "theprimeagen"
 ```
 
