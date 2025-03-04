@@ -1,5 +1,10 @@
 Download YouTube and Twitch streams as they go live. Never miss a livestream again.
 
+## Dependencies
+
+`vdl` depends on [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) being found in the PATH.
+It should download the latest version on its own in the future.
+
 ## Install
 
 `vdl` can be installed with cargo.
