@@ -1,3 +1,4 @@
+use clap::Parser;
 use eyre::eyre;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,6 @@ use std::io::Write;
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use clap::Parser;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -115,36 +115,6 @@ impl Viewer {
         args
     }
 
-    /*fn video_info(&self, id: &str) -> Result<VideoInfo, ()> {
-        let url = format!("https://www.youtube.com/watch?v={id}");
-        let output = Command::new("yt-dlp")
-            .args(self.args())
-            .arg("-J")
-            .arg(url)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        if !output.status.success() || stderr.lines().any(|x| x.starts_with("ERROR")) {
-            eprintln!("FAILURE:\nstderr:\n{stderr}\nstdout:\n{stdout}");
-            return Err(());
-        }
-
-        let parsed: JsonValue = stdout.parse().unwrap();
-        let object: &HashMap<_, _> = parsed.get().unwrap();
-        let id: String = object
-            .get("id")
-            .and_then(String::json_value_as)
-            .unwrap()
-            .clone();
-        let title = object
-            .get("title")
-            .and_then(String::json_value_as)
-            .unwrap()
-            .clone();
-        Ok(VideoInfo { id, title })
-    }*/
-
     fn live_info(&self, id: &str) -> eyre::Result<Option<YtLiveInfo>> {
         let url = format!("https://www.youtube.com/{id}/live");
         let output = Command::new("yt-dlp")
@@ -165,6 +135,7 @@ impl Viewer {
         let current_dir = std::env::current_dir()?;
         let Ok(output) = Command::new("yt-dlp")
             .args([&url, "--print", "_filename"])
+            .args(self.args())
             .output()
         else {
             return Ok(());
@@ -212,7 +183,12 @@ impl Viewer {
             .args(self.args())
             // yt-dlp often doesn't write to what it says it will, so that's why I must
             // remind it to.
-            .args([&url, "--output", tmp_out_path.to_str().unwrap()])
+            .args([
+                &url,
+                "--output",
+                tmp_out_path.to_str().unwrap(),
+                "--write-info-json",
+            ])
             .stdout(stdout)
             .stderr(stderr)
             .status()?;
@@ -267,17 +243,56 @@ struct YtLiveInfo {
 
 #[derive(Debug, Default)]
 struct SubscriberList {
-    // A list of YouTube channel URls
-    pub yt: HashSet<String>,
-    // A list of Twitch channel names/IDs
-    pub twitch: HashSet<String>,
+    pub ids: HashSet<Id>,
 }
 
 // TODO:
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
 enum Id {
-    Yt(String),
-    Twitch(String),
+    Yt { yt_id: String },
+    Twitch { twitch_id: String },
+}
+
+impl Id {
+    fn inner(self) -> String {
+        match self {
+            Id::Yt { yt_id } => yt_id,
+            Id::Twitch { twitch_id } => twitch_id,
+        }
+    }
+    fn as_str(&self) -> &str {
+        match self {
+            Id::Yt { yt_id } => yt_id.as_str(),
+            Id::Twitch { twitch_id } => twitch_id.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Id::Yt { yt_id } => write!(f, "yt:{yt_id}"),
+            Id::Twitch { twitch_id } => write!(f, "twitch:{twitch_id}"),
+        }
+    }
+}
+
+impl std::str::FromStr for Id {
+    type Err = eyre::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(s) = s.strip_prefix("yt:") {
+            Ok(Self::Yt {
+                yt_id: s.to_string(),
+            })
+        } else if let Some(s) = s.strip_prefix("twitch:") {
+            Ok(Self::Twitch {
+                twitch_id: s.to_string(),
+            })
+        } else {
+            Err(eyre!("{s} is not a valid id"))
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -285,10 +300,10 @@ struct Subscriber {
     // YouTube Channel URLs
     pub list: Arc<Mutex<SubscriberList>>,
 
-    pub watching: HashMap<String, std::thread::JoinHandle<eyre::Result<()>>>,
-    pub downloaded: HashSet<String>,
+    pub watching: HashMap<Id, std::thread::JoinHandle<eyre::Result<()>>>,
+    pub downloaded: HashSet<Id>,
+    progress_bars: HashMap<Id, ProgressBar>,
     multi_progress: MultiProgress,
-    progress_bars: HashMap<String, ProgressBar>,
 }
 
 impl Subscriber {
@@ -318,39 +333,47 @@ impl Subscriber {
         if !cache_dir.exists() {
             fs::create_dir_all(&cache_dir)?;
         }
-        // Finish unfinished streams that may've ended
+
+        // Handle unfinished downloads
         for entry in fs::read_dir(&cache_dir)? {
             let Ok(entry) = entry else {
                 continue;
             };
             let id = entry.file_name();
             let id = id.to_string_lossy().to_string();
-            if let Some(id) = id.strip_prefix("twitch:") {
-                let tid = format!("twitch:{id}");
-                let t = std::thread::spawn({
-                    let id = id.to_string();
-                    let twitch = twitch.clone();
-                    move || twitch.twitch_dl(&id)
-                });
-                self.watching.insert(tid.clone(), t);
-                if !silent {
-                    let pb = self.multi_progress.add(pbar());
-                    pb.set_message(format!("{id}'s Twitch stream"));
-                    self.progress_bars.insert(tid, pb);
+
+            let Ok(id) = id.parse::<Id>() else { continue };
+            let t = match id.clone() {
+                Id::Twitch { twitch_id } => {
+                    let t = std::thread::spawn({
+                        let twitch = twitch.clone();
+                        let twitch_id = twitch_id.clone();
+                        move || twitch.twitch_dl(&twitch_id)
+                    });
+                    let pb = pbar();
+                    pb.set_message(format!("{twitch_id}'s Twitch stream"));
+                    if !silent {
+                        let pb = self.multi_progress.add(pb);
+                        self.progress_bars.insert(id.clone(), pb);
+                    }
+                    t
                 }
-            } else {
-                let t = std::thread::spawn({
-                    let id = id.to_string();
-                    let yt = yt.clone();
-                    move || yt.yt_dl(&id)
-                });
-                self.watching.insert(id.clone(), t);
-                if !silent {
-                    let pb = self.multi_progress.add(pbar());
-                    pb.set_message(format!("Resuming YouTube download: {id:?}"));
-                    self.progress_bars.insert(id, pb);
+                Id::Yt { yt_id } => {
+                    let t = std::thread::spawn({
+                        let yt_id = yt_id.clone();
+                        let yt = yt.clone();
+                        move || yt.yt_dl(&yt_id)
+                    });
+                    let pb = pbar();
+                    pb.set_message(format!("Resuming YouTube video: {yt_id}"));
+                    if !silent {
+                        let pb = self.multi_progress.add(pb);
+                        self.progress_bars.insert(id.clone(), pb);
+                    }
+                    t
                 }
-            }
+            };
+            self.watching.insert(id.clone(), t);
         }
 
         loop {
@@ -372,7 +395,7 @@ impl Subscriber {
                     .join()
                     .expect("Download thread shouldn't panic")
                 {
-                    pb.finish_with_message(format!("Download error: {e}"));
+                    pb.finish_with_message(format!("{}: Download error: {e}", pb.message()));
                 } else {
                     pb.finish_with_message("Downloaded!");
                 }
@@ -380,45 +403,53 @@ impl Subscriber {
                 self.downloaded.insert(r);
             }
 
-            for id in list.twitch.iter() {
-                let tid = format!("twitch:{id}");
-                if Viewer::twitch_is_live(id)
-                    && !self.watching.contains_key(&tid)
-                    && !self.downloaded.contains(&tid)
-                {
-                    println!("Downloading {id}'s  livestream!",);
-                    let t = std::thread::spawn({
-                        let id = id.clone();
-                        let twitch = twitch.clone();
-                        move || twitch.twitch_dl(&id)
-                    });
-                    self.watching.insert(tid.clone(), t);
-                    if !silent {
-                        let pb = self.multi_progress.add(pbar());
-                        pb.set_message(format!("{id}'s Twitch stream"));
-                        self.progress_bars.insert(tid, pb);
-                    }
-                }
-            }
-
-            for item in list.yt.iter() {
-                if let Ok(Some(info)) = yt.live_info(item) {
-                    if info.is_live
-                        && !self.watching.contains_key(&info.id)
-                        && !self.downloaded.contains(&info.id)
-                    {
-                        let t = std::thread::spawn({
-                            let id = info.id.clone();
-                            let yt = yt.clone();
-                            move || yt.yt_dl(&id)
-                        });
-                        self.watching.insert(info.id.clone(), t);
-                        if !silent {
-                            let pb = self.multi_progress.add(pbar());
-                            pb.set_message(format!("{:?} by {}", info.title, info.uploader));
-                            self.progress_bars.insert(info.id, pb);
+            for id in list.ids.iter() {
+                match id {
+                    Id::Yt { yt_id } => {
+                        let Ok(Some(info)) = yt.live_info(&yt_id) else {
+                            continue;
+                        };
+                        let video_id = Id::Yt {
+                            yt_id: info.id.clone(),
+                        };
+                        if info.is_live
+                            && !self.watching.contains_key(&video_id)
+                            && !self.downloaded.contains(&video_id)
+                        {
+                            let thread = std::thread::spawn({
+                                let id = info.id.clone();
+                                let yt = yt.clone();
+                                move || yt.yt_dl(&id)
+                            });
+                            self.watching.insert(video_id.clone(), thread);
+                            if !silent {
+                                let pb = self.multi_progress.add(pbar());
+                                pb.set_message(format!(
+                                    "{:?} by {}",
+                                    info.title, info.uploader
+                                ));
+                                self.progress_bars.insert(video_id, pb);
+                            }
                         }
                     }
+                    Id::Twitch { twitch_id }
+                        if Viewer::twitch_is_live(&twitch_id)
+                            && !self.watching.contains_key(&id)
+                            && !self.downloaded.contains(&id) =>
+                    {
+                        let thread = std::thread::spawn({
+                            let twitch_id = twitch_id.clone();
+                            let twitch = twitch.clone();
+                            move || twitch.twitch_dl(&twitch_id)
+                        });
+                        self.watching.insert(id.clone(), thread);
+                        if !silent {
+                            let pb = self.multi_progress.add(pbar());
+                            pb.set_message(format!("{id}'s Twitch stream"));
+                            self.progress_bars.insert(id.clone(), pb);
+                        }
+                    }
+                    _ => {}
                 }
             }
             std::mem::drop(list);
@@ -434,11 +465,8 @@ impl Subscriber {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Config {
     dir: Option<PathBuf>,
-    /// YouTube ids
     #[serde(default)]
-    yt: HashSet<String>,
-    #[serde(default)]
-    twitch: HashSet<String>,
+    ids: HashSet<Id>,
 }
 
 impl Config {
@@ -466,11 +494,10 @@ impl Config {
 #[command(version, about)]
 struct Args {
     #[arg(short, long)]
-    silent: bool
+    silent: bool,
 }
 
 fn main() -> eyre::Result<()> {
-    let exit = Arc::new(AtomicBool::new(false));
     let reload_config = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGHUP, reload_config.clone()).unwrap();
 
@@ -488,14 +515,11 @@ fn main() -> eyre::Result<()> {
     let sublist = subscriber.list.clone();
     {
         let mut list = sublist.lock().unwrap();
-        *list = SubscriberList {
-            yt: config.yt,
-            twitch: config.twitch,
-        };
+        *list = SubscriberList { ids: config.ids };
     }
-    
-    let subscriber = std::thread::spawn( move || subscriber.spawn(args.silent));
-    
+
+    let subscriber = std::thread::spawn(move || subscriber.spawn(args.silent));
+
     loop {
         if subscriber.is_finished() {
             eprintln!("Subscriber exited!");
@@ -510,10 +534,7 @@ fn main() -> eyre::Result<()> {
                     let old_dir = config.dir;
                     config = c;
                     let mut list = sublist.lock().unwrap();
-                    *list = SubscriberList {
-                        yt: config.yt,
-                        twitch: config.twitch,
-                    };
+                    *list = SubscriberList { ids: config.ids };
                     if config.dir.is_some() && config.dir != old_dir {
                         let dir = config.dir.as_deref().unwrap();
                         std::env::set_current_dir(dir)
