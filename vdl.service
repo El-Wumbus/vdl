@@ -1,0 +1,10 @@
+[Unit]
+Description=Automatic stream VOD downloader
+
+[Service]
+Type=exec
+ExecStart=/path/to/vdl watch --silent
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=default.target

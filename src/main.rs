@@ -392,12 +392,12 @@ impl Subscriber {
             }
 
             for id in inner.ids.clone() {
-                let dl_dir = cache_dir.join(id.to_string());
                 match &id {
                     Id::Yt { yt_id } => {
                         let Ok(Some(info)) = yt.live_info(&yt_id) else {
                             continue;
                         };
+                        let dl_dir = cache_dir.join(Id::Yt {yt_id: info.id.clone()}.to_string());
                         let video_id = Id::Yt {
                             yt_id: info.id.clone(),
                         };
@@ -426,6 +426,7 @@ impl Subscriber {
                             && !inner.watching.contains_key(&id)
                             && !inner.downloaded.contains(&id) =>
                     {
+                        let dl_dir = cache_dir.join(id.to_string());
                         let thread = std::thread::spawn({
                             let twitch_id = twitch_id.clone();
                             let twitch = twitch.clone();
