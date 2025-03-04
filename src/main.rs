@@ -555,19 +555,24 @@ impl Ipc {
 #[derive(Debug, Parser)]
 #[command(version, about)]
 enum Args {
+    /// Spawn the VOD downloading server.
     Watch {
         #[arg(short, long)]
         silent: bool,
     },
 
+    /// Communicate with the locally running VDL server.
     Ipc {
         #[command(subcommand)]
         subcommand: IpcCommand,
     },
+    /// Write shell-completions and exit.
+    Completions,
 }
 
 #[derive(Debug, Subcommand)]
 enum IpcCommand {
+    /// Find out what streams the server is currently downloading, if any.
     GetWatching,
 }
 
@@ -576,6 +581,29 @@ fn main() -> eyre::Result<()> {
     match command {
         Args::Watch { silent } => serve(silent),
         Args::Ipc { subcommand } => ipc(subcommand),
+        Args::Completions => {
+            use clap_complete::Shell;
+            use clap::CommandFactory;
+            let mut cmd = Args::command();
+            let shell = Shell::from_env().ok_or_else(||eyre!("Couldn't determine shell from environment!"))?;
+            
+            match shell {
+                Shell::Fish => {
+                    let vendor_completions_dir = dirs::data_dir().expect("data dir").join("fish/vendor_completions.d");
+                    let vendor_completions_path = vendor_completions_dir.join("vdl.fish");
+                    if !vendor_completions_dir.exists() {
+                        fs::create_dir_all(&vendor_completions_dir)?;
+                    }
+                    let mut f = File::create(&vendor_completions_path)?;
+                    eprintln!("Writing completions to {vendor_completions_path:?}");
+                    clap_complete::generate(shell, &mut cmd, NAME, &mut f);
+                }
+                _=> {
+                    clap_complete::generate(shell, &mut cmd, NAME, &mut std::io::stdout());
+                }
+            };
+            Ok(())       
+        }
     }
 }
 

@@ -13,7 +13,8 @@ strip = true
 
 [dependencies]
 basic-toml = "0.1.9"
-clap = { version = "4.5.31", features = ["derive"] }
+clap = { version = "4.5.31", features = ["color", "derive"] }
+clap_complete = "4.5.46"
 dirs = "6.0.0"
 eyre = "0.6.12"
 indicatif = "0.17.11"
