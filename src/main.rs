@@ -674,8 +674,9 @@ fn serve(silent: bool) -> eyre::Result<()> {
         .join(NAME)
         .join("config.toml");
     let mut config = Config::load(&config_path)?;
-    if let Some(dir) = config.dir.as_deref() {
-        std::env::set_current_dir(dir).map_err(|e| eyre!("{dir:?}: {e}"))?;
+    
+    if let Some(dir) = config.dir.clone().or_else(dirs::video_dir) {
+        std::env::set_current_dir(&dir).map_err(|e| eyre!("{dir:?}: {e}"))?;
     }
 
     let subscriber = Subscriber::default();
