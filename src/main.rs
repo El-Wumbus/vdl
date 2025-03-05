@@ -7,216 +7,122 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::num::NonZeroU8;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[allow(dead_code)]
+mod yt_dlp;
+
+use yt_dlp::*;
+
 const NAME: &'static str = env!("CARGO_PKG_NAME");
 
-#[derive(Clone, Debug)]
-struct Viewer {
-    live_from_start:      bool,
-    embed_metadata:       bool,
-    embed_thumbnail:      bool,
-    no_progress:          bool,
-    concurrent_fragments: Option<NonZeroU8>,
-    playlist_items:       Option<u64>,
-    remux_video:          Option<String>,
-    cookies_from_browser: Option<String>,
-}
-impl Default for Viewer {
-    fn default() -> Self {
-        Self {
-            live_from_start:      false,
-            embed_metadata:       true,
-            embed_thumbnail:      true,
-            no_progress:          true,
-            concurrent_fragments: None,
-            cookies_from_browser: None,
-            remux_video:          None,
-            playlist_items:       None,
-        }
+fn live_info(yt_dlp: &YtDlp, id: &str) -> eyre::Result<Option<YtLiveInfo>> {
+    let url = format!("https://www.youtube.com/{id}/live");
+    let output = yt_dlp.command_with_args().arg("-J").arg(url).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return Ok(None);
     }
+    let info: YtLiveInfo = serde_json::from_str(&stdout)?;
+    Ok(Some(info))
 }
 
-impl Viewer {
-    fn concurrent_fragments(&mut self, n: Option<NonZeroU8>) -> &mut Self {
-        self.concurrent_fragments = n;
-        self
+fn dl(yt_dlp: &YtDlp, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
+    let current_dir = std::env::current_dir()?;
+    let Ok(output) = yt_dlp
+        .command_with_args()
+        .args([&url, "--print", "_filename"])
+        .output()
+    else {
+        return Ok(());
+    };
+    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return Err(eyre!("Filename is empty!"));
     }
-    fn playlist_items(&mut self, n: Option<u64>) -> &mut Self {
-        self.playlist_items = n;
-        self
+    let mut output_filename = PathBuf::from(stdout);
+    if let Some(format) = yt_dlp.remux_video.as_deref() {
+        output_filename.set_extension(format);
     }
-    fn cookies_from_browser(&mut self, browser: Option<&str>) -> &mut Self {
-        self.cookies_from_browser = browser.map(str::to_string);
-        self
-    }
-    fn live_from_start(&mut self, enabled: bool) -> &mut Self {
-        self.live_from_start = enabled;
-        self
-    }
-    fn embed_metadata(&mut self, enabled: bool) -> &mut Self {
-        self.embed_metadata = enabled;
-        self
-    }
-    fn embed_thumbnail(&mut self, enabled: bool) -> &mut Self {
-        self.embed_thumbnail = enabled;
-        self
-    }
-    fn no_progress(&mut self, no_progress: bool) -> &mut Self {
-        self.no_progress = no_progress;
-        self
-    }
-    fn remux_video(&mut self, format: Option<&str>) -> &mut Self {
-        self.remux_video = format.map(str::to_string);
-        self
-    }
+    let final_out = current_dir.join(&output_filename);
+    let tmp_out_path = dl_dir.join(&output_filename);
 
-    fn args(&self) -> Vec<String> {
-        let mut args = vec![];
-        if self.live_from_start {
-            args.push("--live-from-start".to_string());
-        }
-        if self.embed_metadata {
-            args.push("--embed-metadata".to_string());
-        }
-        if self.embed_thumbnail {
-            args.push("--embed-thumbnail".to_string());
-        }
-        if self.no_progress {
-            args.push("--no-progress".to_string());
-        }
-        if let Some(n) = self.concurrent_fragments {
-            args.push("--concurrent-fragments".to_string());
-            args.push(n.to_string());
-        }
-        if let Some(n) = self.playlist_items {
-            args.push("--playlist-items".to_string());
-            args.push(n.to_string());
-        }
-        if let Some(browser) = &self.cookies_from_browser {
-            args.push("--cookies-from-browser".to_string());
-            args.push(browser.clone());
-        }
-        if let Some(format) = &self.remux_video {
-            args.push("--remux-video".to_string());
-            args.push(format.clone());
-        }
-
-        args
+    if fs::exists(&final_out)? {
+        return Ok(());
     }
-
-    fn live_info(&self, id: &str) -> eyre::Result<Option<YtLiveInfo>> {
-        let url = format!("https://www.youtube.com/{id}/live");
-        let output = Command::new("yt-dlp")
-            .args(self.args())
-            .arg("-J")
-            .arg(url)
-            .output()?;
-        let stdout = String::from_utf8(output.stdout)?;
-        let stdout = stdout.trim();
-        if stdout.is_empty() {
-            return Ok(None);
-        }
-        let info: YtLiveInfo = serde_json::from_str(&stdout)?;
-        Ok(Some(info))
-    }
-
-    fn dl(&self, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
-        let current_dir = std::env::current_dir()?;
-        let Ok(output) = Command::new("yt-dlp")
-            .args([&url, "--print", "_filename"])
-            .args(self.args())
-            .output()
-        else {
-            return Ok(());
-        };
-        let stdout = String::from_utf8(output.stdout)?;
-        let stdout = stdout.trim();
-        if stdout.is_empty() {
-            return Err(eyre!("Filename is empty!"));
-        }
-        let mut output_filename = PathBuf::from(stdout);
-        if let Some(format) = self.remux_video.as_deref() {
-            output_filename.set_extension(format);
-        }
-        let final_out = current_dir.join(&output_filename);
-        let tmp_out_path = dl_dir.join(&output_filename);
-
-        if fs::exists(&final_out)? {
-            return Ok(());
-        }
-        if tmp_out_path.exists() {
-            fs::rename(&tmp_out_path, &final_out)
-                .map_err(|e| eyre!("{e}: {tmp_out_path:?} -> {final_out:?}"))?;
-
-            fs::remove_dir_all(dl_dir)?;
-            return Ok(());
-        }
-
-        let stdout_path = dl_dir.join("yt-dlp-stdout.log");
-        let stderr_path = dl_dir.join("yt-dlp-stderr.log");
-        if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
-            fs::remove_dir_all(&dl_dir)?;
-        }
-        fs::create_dir_all(&dl_dir)?;
-        let stdout = match File::create(&stdout_path) {
-            Ok(x) => Stdio::from(x),
-            Err(_) => Stdio::null(),
-        };
-        let stderr = match File::create(&stderr_path) {
-            Ok(x) => Stdio::from(x),
-            Err(_) => Stdio::null(),
-        };
-
-        let _status = Command::new("yt-dlp")
-            .current_dir(&dl_dir)
-            .args(self.args())
-            // yt-dlp often doesn't write to what it says it will, so that's why I must
-            // remind it to.
-            .args([
-                &url,
-                "--output",
-                tmp_out_path.to_str().unwrap(),
-                "--write-info-json",
-            ])
-            .stdout(stdout)
-            .stderr(stderr)
-            .status()?;
-
+    if tmp_out_path.exists() {
         fs::rename(&tmp_out_path, &final_out)
             .map_err(|e| eyre!("{e}: {tmp_out_path:?} -> {final_out:?}"))?;
+
         fs::remove_dir_all(dl_dir)?;
-        Ok(())
+        return Ok(());
     }
 
-    fn yt_dl(&self, id: &str, dl_dir: PathBuf) -> eyre::Result<()> {
-        let url = format!("https://www.youtube.com/watch?v={id}");
-        self.dl(&url, dl_dir)
+    let stdout_path = dl_dir.join("yt-dlp-stdout.log");
+    let stderr_path = dl_dir.join("yt-dlp-stderr.log");
+    if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
+        fs::remove_dir_all(&dl_dir)?;
     }
+    fs::create_dir_all(&dl_dir)?;
+    let stdout = match File::create(&stdout_path) {
+        Ok(x) => Stdio::from(x),
+        Err(_) => Stdio::null(),
+    };
+    let stderr = match File::create(&stderr_path) {
+        Ok(x) => Stdio::from(x),
+        Err(_) => Stdio::null(),
+    };
 
-    fn twitch_is_live(id: &str) -> bool {
-        let url = format!("https://www.twitch.tv/{id}");
-        let Ok(output) = Command::new("yt-dlp")
-            .args([&url, "--quiet", "--simulate"])
-            .output()
-        else {
-            return false;
-        };
+    let _status = yt_dlp
+        .command_with_args()
+        .current_dir(&dl_dir)
+        // yt-dlp often doesn't write to what it says it will, so that's why I must
+        // remind it to.
+        .args([
+            &url,
+            "--output",
+            tmp_out_path.to_str().unwrap(),
+            "--write-info-json",
+        ])
+        .stdout(stdout)
+        .stderr(stderr)
+        .status()?;
 
-        String::from_utf8(output.stderr)
-            .is_ok_and(|x| !x.contains("The channel is not currently live"))
-    }
+    fs::rename(&tmp_out_path, &final_out)
+        .map_err(|e| eyre!("{e}: {tmp_out_path:?} -> {final_out:?}"))?;
+    fs::remove_dir_all(dl_dir)?;
+    Ok(())
+}
 
-    fn twitch_dl(&self, id: &str, dl_dir: PathBuf) -> eyre::Result<()> {
-        let url = format!("https://www.twitch.tv/{id}");
-        self.dl(&url, dl_dir)
-    }
+fn yt_dl(yt_dlp: &YtDlp, id: &str, dl_dir: PathBuf) -> eyre::Result<()> {
+    let url = format!("https://www.youtube.com/watch?v={id}");
+    dl(yt_dlp, &url, dl_dir)
+}
+
+fn twitch_is_live(yt_dlp: &YtDlp, id: &str) -> bool {
+    let url = format!("https://www.twitch.tv/{id}");
+    let Ok(output) = yt_dlp
+        .command_with_args()
+        .args([&url, "--quiet", "--simulate"])
+        .output()
+    else {
+        return false;
+    };
+
+    String::from_utf8(output.stderr)
+        .is_ok_and(|x| !x.contains("The channel is not currently live"))
+}
+
+fn twitch_dl(yt_dlp: &YtDlp, id: &str, dl_dir: PathBuf) -> eyre::Result<()> {
+    let url = format!("https://www.twitch.tv/{id}");
+    dl(yt_dlp, &url, dl_dir)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,12 +207,12 @@ impl Subscriber {
             pb
         }
 
-        let mut yt = Viewer::default();
+        let mut yt = YtDlp::default();
         yt.live_from_start(true)
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
 
-        let mut twitch = Viewer::default();
+        let mut twitch = YtDlp::default();
         twitch
             .remux_video(Some("mkv"))
             .cookies_from_browser(Some("firefox"));
@@ -331,7 +237,7 @@ impl Subscriber {
                     let t = std::thread::spawn({
                         let twitch = twitch.clone();
                         let twitch_id = twitch_id.clone();
-                        move || twitch.twitch_dl(&twitch_id, dl_dir)
+                        move || twitch_dl(&twitch, &twitch_id, dl_dir)
                     });
                     if !silent {
                         let pb = pbar();
@@ -345,7 +251,7 @@ impl Subscriber {
                     let t = std::thread::spawn({
                         let yt_id = yt_id.clone();
                         let yt = yt.clone();
-                        move || yt.yt_dl(&yt_id, dl_dir)
+                        move || yt_dl(&yt, &yt_id, dl_dir)
                     });
                     if !silent {
                         let pb = pbar();
@@ -394,10 +300,15 @@ impl Subscriber {
             for id in inner.ids.clone() {
                 match &id {
                     Id::Yt { yt_id } => {
-                        let Ok(Some(info)) = yt.live_info(&yt_id) else {
+                        let Ok(Some(info)) = live_info(&yt, &yt_id) else {
                             continue;
                         };
-                        let dl_dir = cache_dir.join(Id::Yt {yt_id: info.id.clone()}.to_string());
+                        let dl_dir = cache_dir.join(
+                            Id::Yt {
+                                yt_id: info.id.clone(),
+                            }
+                            .to_string(),
+                        );
                         let video_id = Id::Yt {
                             yt_id: info.id.clone(),
                         };
@@ -408,7 +319,7 @@ impl Subscriber {
                             let thread = std::thread::spawn({
                                 let id = info.id.clone();
                                 let yt = yt.clone();
-                                move || yt.yt_dl(&id, dl_dir)
+                                move || yt_dl(&yt, &id, dl_dir)
                             });
                             inner.watching.insert(video_id.clone(), thread);
                             if !silent {
@@ -422,7 +333,7 @@ impl Subscriber {
                         }
                     }
                     Id::Twitch { twitch_id }
-                        if Viewer::twitch_is_live(&twitch_id)
+                        if twitch_is_live(&twitch, &twitch_id)
                             && !inner.watching.contains_key(&id)
                             && !inner.downloaded.contains(&id) =>
                     {
@@ -430,7 +341,7 @@ impl Subscriber {
                         let thread = std::thread::spawn({
                             let twitch_id = twitch_id.clone();
                             let twitch = twitch.clone();
-                            move || twitch.twitch_dl(&twitch_id, dl_dir)
+                            move || twitch_dl(&twitch, &twitch_id, dl_dir)
                         });
                         inner.watching.insert(id.clone(), thread);
                         if !silent {
@@ -499,11 +410,11 @@ struct Ipc {
 
 impl Ipc {
     fn new(inner_sub: Arc<Mutex<InnerSub>>) -> eyre::Result<Self> {
-        let state_dir = dirs::state_dir().expect("User state dir").join(NAME);
-        let socket = state_dir.join("ipc.sock");
+        let runtime_dir = dirs::runtime_dir().expect("User runtime dir").join(NAME);
+        let socket = runtime_dir.join("ipc.sock");
 
-        if !state_dir.exists() {
-            fs::create_dir_all(&state_dir)?;
+        if !runtime_dir.exists() {
+            fs::create_dir_all(&runtime_dir)?;
         }
         if socket.exists() {
             fs::remove_file(&socket).map_err(|e| {
@@ -582,14 +493,17 @@ fn main() -> eyre::Result<()> {
         Args::Watch { silent } => serve(silent),
         Args::Ipc { subcommand } => ipc(subcommand),
         Args::Completions => {
-            use clap_complete::Shell;
             use clap::CommandFactory;
+            use clap_complete::Shell;
             let mut cmd = Args::command();
-            let shell = Shell::from_env().ok_or_else(||eyre!("Couldn't determine shell from environment!"))?;
-            
+            let shell = Shell::from_env()
+                .ok_or_else(|| eyre!("Couldn't determine shell from environment!"))?;
+
             match shell {
                 Shell::Fish => {
-                    let vendor_completions_dir = dirs::data_dir().expect("data dir").join("fish/vendor_completions.d");
+                    let vendor_completions_dir = dirs::data_dir()
+                        .expect("data dir")
+                        .join("fish/vendor_completions.d");
                     let vendor_completions_path = vendor_completions_dir.join("vdl.fish");
                     if !vendor_completions_dir.exists() {
                         fs::create_dir_all(&vendor_completions_dir)?;
@@ -598,18 +512,23 @@ fn main() -> eyre::Result<()> {
                     eprintln!("Writing completions to {vendor_completions_path:?}");
                     clap_complete::generate(shell, &mut cmd, NAME, &mut f);
                 }
-                _=> {
-                    clap_complete::generate(shell, &mut cmd, NAME, &mut std::io::stdout());
+                _ => {
+                    clap_complete::generate(
+                        shell,
+                        &mut cmd,
+                        NAME,
+                        &mut std::io::stdout(),
+                    );
                 }
             };
-            Ok(())       
+            Ok(())
         }
     }
 }
 
 fn ipc(command: IpcCommand) -> eyre::Result<()> {
-    let state_dir = dirs::state_dir().expect("User state dir").join(NAME);
-    let socket = state_dir.join("ipc.sock");
+    let runtime_dir = dirs::runtime_dir().expect("User runtime dir").join(NAME);
+    let socket = runtime_dir.join("ipc.sock");
     let mut stream = UnixStream::connect(&socket).map_err(|e| {
         eyre!(
             "Couldn't connect to socket {socket:?} (ensure an instance is running): {e}"
@@ -674,7 +593,7 @@ fn serve(silent: bool) -> eyre::Result<()> {
         .join(NAME)
         .join("config.toml");
     let mut config = Config::load(&config_path)?;
-    
+
     if let Some(dir) = config.dir.clone().or_else(dirs::video_dir) {
         std::env::set_current_dir(&dir).map_err(|e| eyre!("{dir:?}: {e}"))?;
     }
@@ -685,9 +604,11 @@ fn serve(silent: bool) -> eyre::Result<()> {
         let mut inner = inner.lock().unwrap();
         inner.ids = config.ids;
     }
+
     let ipc = Ipc::new(inner.clone())?;
     std::thread::spawn(move || ipc.spawn());
 
+    YtDlp::download_latest()?;
     let subscriber = std::thread::spawn(move || subscriber.spawn(silent));
 
     loop {
@@ -697,8 +618,8 @@ fn serve(silent: bool) -> eyre::Result<()> {
             std::process::exit(1);
         }
         if exit.swap(false, Ordering::Relaxed) {
-            let state_dir = dirs::state_dir().expect("User state dir").join(NAME);
-            let socket = state_dir.join("ipc.sock");
+            let runtime_dir = dirs::runtime_dir().expect("User runtime dir").join(NAME);
+            let socket = runtime_dir.join("ipc.sock");
             let _ = fs::remove_file(socket);
             std::process::exit(1);
         }
@@ -718,7 +639,7 @@ fn serve(silent: bool) -> eyre::Result<()> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to reload state (retaining previous state): {e}")
+                    eprintln!("Failed to reload config (retaining previous config): {e}")
                 }
             }
         }
