@@ -135,20 +135,32 @@ struct YtLiveInfo {
     uploader:    String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Info {
+    id:          String,
+    title:       String,
+    uploader:    String,
+    webpage_url: String,
+}
+
+impl Info {
+    fn get(yt_dlp: &YtDlp, id: &Id) -> eyre::Result<Self> {
+        let url = match id {
+            Id::Yt { yt_id } => format!("https://www.youtube.com/watch?v={yt_id}"),
+            Id::Twitch { twitch_id } => format!("https://www.twitch.tv/{twitch_id}"),
+        };
+        let output = yt_dlp.command_with_args().args(["-J", &url]).output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        Ok(serde_json::from_str(&stdout)?)
+    }
+}
+
 // TODO:
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 enum Id {
     Yt { yt_id: String },
     Twitch { twitch_id: String },
-}
-impl Id {
-    fn as_str(&self) -> &str {
-        match self {
-            Id::Yt { yt_id } => yt_id,
-            Id::Twitch { twitch_id } => twitch_id,
-        }
-    }
 }
 
 impl std::fmt::Display for Id {
@@ -181,6 +193,7 @@ impl std::str::FromStr for Id {
 struct InnerSub {
     pub ids:        HashSet<Id>,
     pub watching:   HashMap<Id, std::thread::JoinHandle<eyre::Result<()>>>,
+    pub info:       HashMap<Id, Info>,
     pub downloaded: HashSet<Id>,
 }
 
@@ -263,6 +276,9 @@ impl Subscriber {
                 }
             };
             inner.watching.insert(id.clone(), t);
+            if let Ok(info) = Info::get(&yt, &id) {
+                inner.info.insert(id.clone(), info);
+            }
         }
         std::mem::drop(inner);
 
@@ -277,6 +293,7 @@ impl Subscriber {
             }
 
             for r in remove {
+                inner.info.remove(&r);
                 let message = if let Err(e) = inner
                     .watching
                     .remove(&r)
@@ -303,15 +320,10 @@ impl Subscriber {
                         let Ok(Some(info)) = live_info(&yt, &yt_id) else {
                             continue;
                         };
-                        let dl_dir = cache_dir.join(
-                            Id::Yt {
-                                yt_id: info.id.clone(),
-                            }
-                            .to_string(),
-                        );
                         let video_id = Id::Yt {
                             yt_id: info.id.clone(),
                         };
+                        let dl_dir = cache_dir.join(video_id.to_string());
                         if info.is_live
                             && !inner.watching.contains_key(&video_id)
                             && !inner.downloaded.contains(&video_id)
@@ -322,6 +334,9 @@ impl Subscriber {
                                 move || yt_dl(&yt, &id, dl_dir)
                             });
                             inner.watching.insert(video_id.clone(), thread);
+                            if let Ok(info) = Info::get(&yt, &video_id) {
+                                inner.info.insert(video_id.clone(), info);
+                            }
                             if !silent {
                                 let pb = self.multi_progress.add(pbar());
                                 pb.set_message(format!(
@@ -344,6 +359,9 @@ impl Subscriber {
                             move || twitch_dl(&twitch, &twitch_id, dl_dir)
                         });
                         inner.watching.insert(id.clone(), thread);
+                        if let Ok(info) = Info::get(&twitch, &id) {
+                            inner.info.insert(id.clone(), info);
+                        }
                         if !silent {
                             let pb = self.multi_progress.add(pbar());
                             pb.set_message(format!("{id}'s Twitch stream"));
@@ -399,7 +417,7 @@ enum IpcRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 enum IpcResponse {
-    Watching(Vec<Id>),
+    Watching(Vec<Info>),
     Error(String),
 }
 
@@ -456,7 +474,8 @@ impl Ipc {
         match req {
             IpcRequest::GetWatching => {
                 let inner = self.inner_sub.lock().unwrap();
-                let watching = inner.watching.keys().cloned().collect::<Vec<_>>();
+                let watching = inner.info.values().cloned().collect::<Vec<_>>();
+
                 IpcResponse::Watching(watching)
             }
         }
@@ -548,29 +567,14 @@ fn ipc(command: IpcCommand) -> eyre::Result<()> {
     let response: IpcResponse = serde_json::de::from_slice(&response_json)?;
     match response {
         IpcResponse::Watching(watching) => {
-            let twitch = watching
-                .iter()
-                .filter(|x| matches!(x, Id::Twitch { .. }))
-                .map(Id::as_str);
-            let yt = watching
-                .iter()
-                .filter(|x| matches!(x, Id::Yt { .. }))
-                .map(Id::as_str);
-
             // TODO: Tabular display
             println!("Watching {} streams", watching.len());
             if !watching.is_empty() {
-                for (i, id) in twitch.enumerate() {
-                    if i == 0 {
-                        println!("Twitch");
-                    }
-                    println!(":: {id}");
-                }
-                for (i, id) in yt.enumerate() {
-                    if i == 0 {
-                        println!("YouTube");
-                    }
-                    println!(":: {id}");
+                for info in watching {
+                    println!(
+                        ":: {:?} - {} ({:?})",
+                        info.title, info.uploader, info.webpage_url
+                    );
                 }
             }
         }
