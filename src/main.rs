@@ -570,7 +570,7 @@ fn dl(yt_dlp: &YtDlp, url: &str, dl_dir: PathBuf) -> eyre::Result<()> {
     if fs::exists(&dl_dir).is_ok_and(|x| x == true) {
         fs::remove_dir_all(&dl_dir)?;
     }
-    fs::create_dir_all(dbg!(&dl_dir))?;
+    fs::create_dir_all(&dl_dir)?;
 
     let mut oo = OpenOptions::new();
     oo.create(true).append(true);
